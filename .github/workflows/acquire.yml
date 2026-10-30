@@ -1,0 +1,93 @@
+name: Acquire current Upwork jobs
+
+on:
+  schedule:
+    - cron: "17,47 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Acquisition mode
+        required: true
+        type: choice
+        options:
+          - automatic
+          - incremental
+          - reconciliation
+        default: automatic
+      force:
+        description: Run even when the authoritative checkpoint is not due
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: radarjobs-upwork-production
+  cancel-in-progress: false
+
+jobs:
+  acquire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Resolve the exact backend revision deployed in production
+        id: production
+        shell: bash
+        run: |
+          set -euo pipefail
+          oidc_response="$(curl --fail --silent --show-error \
+            --header "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https%3A%2F%2Fapi.revenirdata.com%2Finternal%2Fupwork")"
+          oidc_token="$(jq -er '.value' <<<"$oidc_response")"
+          plan="$(curl --fail --silent --show-error \
+            --header "Authorization: Bearer ${oidc_token}" \
+            "https://api.revenirdata.com/internal/workspaces/radar/sources/upwork/acquisition-plan")"
+          code_sha="$(jq -er '.code_sha' <<<"$plan")"
+          if [[ ! "$code_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Production returned an invalid backend revision." >&2
+            exit 1
+          fi
+          echo "code_sha=$code_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the production backend revision read-only
+        uses: actions/checkout@v4
+        with:
+          repository: revenirdata/revenir-radar-backend
+          ref: ${{ steps.production.outputs.code_sha }}
+          ssh-key: ${{ secrets.BACKEND_READONLY_DEPLOY_KEY }}
+          path: backend
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      - name: Install the locked collector runtime
+        working-directory: backend
+        run: uv sync --frozen --no-dev --group application-worker
+
+      - name: Collect and submit current Upwork jobs
+        working-directory: backend
+        shell: bash
+        env:
+          CODE_SHA: ${{ steps.production.outputs.code_sha }}
+          RUN_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'automatic' }}
+          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.force || false }}
+        run: |
+          set -euo pipefail
+          args=(
+            --api-url https://api.revenirdata.com
+            --expected-code-sha "$CODE_SHA"
+            --orchestration-id "github-public:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"
+            --mode "$RUN_MODE"
+            --submit-only
+          )
+          if [[ "$FORCE_RUN" == "true" ]]; then
+            args+=(--force)
+          fi
+          uv run --no-sync python -m scripts.run_remote_upwork_acquisition "${args[@]}"
