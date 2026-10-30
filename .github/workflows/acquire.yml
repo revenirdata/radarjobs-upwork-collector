@@ -42,6 +42,16 @@ jobs:
             --header "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
             "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https%3A%2F%2Fapi.revenirdata.com%2Finternal%2Fupwork")"
           oidc_token="$(jq -er '.value' <<<"$oidc_response")"
+          oidc_payload="${oidc_token#*.}"
+          oidc_payload="${oidc_payload%%.*}"
+          case $((${#oidc_payload} % 4)) in
+            2) oidc_payload="${oidc_payload}==" ;;
+            3) oidc_payload="${oidc_payload}=" ;;
+          esac
+          printf '%s' "$oidc_payload" \
+            | tr '_-' '/+' \
+            | base64 --decode \
+            | jq '{aud, event_name, ref, repository, sub, workflow_ref}'
           plan="$(curl --fail --silent --show-error \
             --header "Authorization: Bearer ${oidc_token}" \
             "https://api.revenirdata.com/internal/workspaces/radar/sources/upwork/acquisition-plan")"
